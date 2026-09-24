@@ -456,6 +456,20 @@
         const outCtx = outCanvas.getContext('2d');
         const outData = outCtx.createImageData(w, h);
 
+        // Sanity check: detect uniform mask (model failed to segment)
+        let hasBackground = false, hasPerson = false;
+        for (let i = 0; i < maskArr.length; i++) {
+          if (maskArr[i] <= 0.5) hasBackground = true;
+          else hasPerson = true;
+          if (hasBackground && hasPerson) break;
+        }
+        if (!hasBackground) {
+          throw new Error('The AI could not find a background to remove. Try a clearer front-facing photo of a real person.');
+        }
+        if (!hasPerson) {
+          throw new Error('The AI could not detect a person in the photo. Try a clearer front-facing photo.');
+        }
+
         // Fast path: mask same size as image
         if (mw === w && mh === h) {
           outData.data.set(srcData.data);
