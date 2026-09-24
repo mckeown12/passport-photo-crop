@@ -232,11 +232,14 @@
     const result     = document.getElementById('result');
     const resultImg  = document.getElementById('resultImg');
     const downloadLink = document.getElementById('downloadLink');
+    const downloadPdfBtn = document.getElementById('downloadPdfBtn');
     const backBtn    = document.getElementById('backBtn');
     const info       = document.getElementById('info');
     const loadingOverlay = document.getElementById('loadingOverlay');
     const loadingText    = document.getElementById('loadingText');
     const bgStatus       = document.getElementById('bgStatus');
+
+    let lastExportDataUrl = '';
 
     // ─── Constants ───
     const SIZE = 600;
@@ -602,13 +605,36 @@
       octx.scale(scale, scale);
       octx.drawImage(img, -img.width / 2, -img.height / 2);
       octx.restore();
-      const dataUrl = out.toDataURL('image/png');
-      resultImg.src = dataUrl; downloadLink.href = dataUrl;
+      lastExportDataUrl = out.toDataURL('image/png');
+      resultImg.src = lastExportDataUrl; downloadLink.href = lastExportDataUrl;
       canvasWrapper.classList.remove('active'); controls.classList.remove('active');
       info.style.display = 'none'; result.classList.add('active');
     });
 
     backBtn.addEventListener('click', () => { result.classList.remove('active'); canvasWrapper.classList.add('active'); controls.classList.add('active'); info.style.display = 'block'; });
+
+    downloadPdfBtn.addEventListener('click', async () => {
+      if (!lastExportDataUrl) return;
+      downloadPdfBtn.disabled = true;
+      downloadPdfBtn.textContent = 'Generating PDF\u2026';
+      try {
+        const { jsPDF } = await import('https://cdn.jsdelivr.net/npm/jspdf@2.5.1/+esm');
+        // US Letter page, white background, 2\u00d72 image centered
+        const pdf = new jsPDF({ unit: 'in', format: 'letter', orientation: 'portrait' });
+        const pageW = 8.5, pageH = 11;
+        const imgW = 2, imgH = 2;
+        const x = (pageW - imgW) / 2;
+        const y = (pageH - imgH) / 2;
+        pdf.addImage(lastExportDataUrl, 'PNG', x, y, imgW, imgH);
+        pdf.save('passport-photo-2x2.pdf');
+      } catch (e) {
+        console.error('PDF generation failed:', e);
+        alert('PDF generation failed. Please use the PNG download instead.');
+      } finally {
+        downloadPdfBtn.disabled = false;
+        downloadPdfBtn.textContent = 'Download PDF (Print-Ready)';
+      }
+    });
 
     // Keyboard
     document.addEventListener('keydown', (e) => {
