@@ -412,7 +412,7 @@
 
       try {
         // Lazy-load MediaPipe once (use confidence masks for reliability)
-        if (!window.mediapipeSegmenter) {
+        if (!window.mediapipeSegmenterV2) {
           const mod = await import(
             'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm'
           );
@@ -423,7 +423,7 @@
           const vision = await FilesetResolver.forVisionTasks(
             'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
           );
-          window.mediapipeSegmenter = await ImageSegmenter.createFromOptions(vision, {
+          window.mediapipeSegmenterV2 = await ImageSegmenter.createFromOptions(vision, {
             baseOptions: {
               modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite',
               delegate: 'GPU'
@@ -433,7 +433,7 @@
             outputCategoryMask: false
           });
         }
-        const seg = window.mediapipeSegmenter;
+        const seg = window.mediapipeSegmenterV2;
 
         // Full-res source canvas
         const w = originalImg.width;
@@ -588,7 +588,7 @@
       uploadZone.classList.remove('hidden'); canvasWrapper.classList.remove('active');
       controls.classList.remove('active'); info.style.display = 'block'; result.classList.remove('active');
       fileInput.value = ''; bgStatus.textContent = '';
-      window.mediapipeSegmenter = null;
+      window.mediapipeSegmenterV2 = null;
       removeBgBtn.textContent = '\u2728 Remove Background';
     });
 
