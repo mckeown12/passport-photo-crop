@@ -257,7 +257,6 @@
     let originalImg = null; // before bg removal
     let scale = 1, offsetX = 0, offsetY = 0, rotation = 0;
     let isDragging = false, lastX = 0, lastY = 0;
-    let segmenter = null;
     let isRemoving = false;
 
     // ─── Drawing ───
@@ -408,18 +407,23 @@
       isRemoving = true;
       removeBgBtn.disabled = true;
       loadingOverlay.classList.add('active');
+      bgStatus.textContent = '';
       loadingText.textContent = 'Loading AI model\u2026';
 
       try {
-        if (!segmenter) {
-          const { ImageSegmenter, FilesetResolver } = await import(
+        // Lazy-load MediaPipe once
+        if (!window.mediapipeSegmenter) {
+          const mod = await import(
             'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm'
           );
+          const ImageSegmenter = mod.ImageSegmenter;
+          const FilesetResolver = mod.FilesetResolver;
+
           loadingText.textContent = 'Initializing model\u2026';
           const vision = await FilesetResolver.forVisionTasks(
             'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
           );
-          segmenter = await ImageSegmenter.createFromOptions(vision, {
+          window.mediapipeSegmenter = await ImageSegmenter.createFromOptions(vision, {
             baseOptions: {
               modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite',
               delegate: 'GPU'
@@ -428,69 +432,80 @@
             outputCategoryMask: true
           });
         }
+        const seg = window.mediapipeSegmenter;
+
+        // Draw full-res original to a canvas
+        const w = img.width;
+        const h = img.height;
+        const srcCanvas = document.createElement('canvas');
+        srcCanvas.width = w; srcCanvas.height = h;
+        const srcCtx = srcCanvas.getContext('2d');
+        srcCtx.drawImage(originalImg, 0, 0);
+        const srcData = srcCtx.getImageData(0, 0, w, h);
 
         loadingText.textContent = 'Segmenting portrait\u2026';
-        const segCanvas = document.createElement('canvas');
-        segCanvas.width = img.width;
-        segCanvas.height = img.height;
-        const segCtx = segCanvas.getContext('2d');
-        segCtx.drawImage(img, 0, 0);
+        const segResult = seg.segment(srcCanvas);
+        const categoryMask = segResult.categoryMask;
 
-        await segmenter.setOptions({ outputCategoryMask: true });
-        const result = segmenter.segment(segCanvas);
+        // Build output by replacing background pixels with white
+        const mw = categoryMask.width;
+        const mh = categoryMask.height;
+        const maskArr = categoryMask.getAsFloat32Array();
+        const outCanvas = document.createElement('canvas');
+        outCanvas.width = w; outCanvas.height = h;
+        const outCtx = outCanvas.getContext('2d');
+        const outData = outCtx.createImageData(w, h);
 
-        // Build mask data from category mask
-        const mask = result.categoryMask;
-        const maskCanvas = document.createElement('canvas');
-        maskCanvas.width = mask.width;
-        maskCanvas.height = mask.height;
-        const mCtx = maskCanvas.getContext('2d');
-        const idata = mCtx.createImageData(mask.width, mask.height);
-        // The mask values are typically packed; for selfie segmenter, person = category 1
-        // The getAsFloat32Array or getAsUint8Array method exists on the mask
-        const floats = mask.getAsFloat32Array ? mask.getAsFloat32Array() : null;
-        if (!floats) throw new Error('Mask format unsupported');
-        for (let i = 0; i < floats.length; i++) {
-          const v = floats[i] > 0.5 ? 255 : 0;
-          idata.data[i * 4] = v;
-          idata.data[i * 4 + 1] = v;
-          idata.data[i * 4 + 2] = v;
-          idata.data[i * 4 + 3] = 255;
+        // Fast path: mask same size as image
+        if (mw === w && mh === h) {
+          outData.data.set(srcData.data);
+          for (let i = 0; i < maskArr.length; i++) {
+            if (maskArr[i] <= 0.5) { // background
+              const p = i * 4;
+              outData.data[p] = outData.data[p + 1] = outData.data[p + 2] = 255;
+            }
+          }
+        } else {
+          // Resampled path (mask may be downscaled)
+          const sx = w / mw;
+          const sy = h / mh;
+          for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+              const mx = Math.min(mw - 1, Math.floor(x / sx));
+              const my = Math.min(mh - 1, Math.floor(y / sy));
+              const isPerson = maskArr[my * mw + mx] > 0.5;
+              const p = (y * w + x) * 4;
+              if (isPerson) {
+                outData.data[p]     = srcData.data[p];
+                outData.data[p + 1] = srcData.data[p + 1];
+                outData.data[p + 2] = srcData.data[p + 2];
+              } else {
+                outData.data[p] = outData.data[p + 1] = outData.data[p + 2] = 255;
+              }
+              outData.data[p + 3] = 255;
+            }
+          }
         }
-        mCtx.putImageData(idata, 0, 0);
-
-        // Composite: white BG + original RGB + mask alpha
-        const out = document.createElement('canvas');
-        out.width = img.width;
-        out.height = img.height;
-        const oCtx = out.getContext('2d');
-        oCtx.fillStyle = '#ffffff';
-        oCtx.fillRect(0, 0, out.width, out.height);
-        oCtx.drawImage(img, 0, 0);
-        // Apply mask as alpha using destination-in
-        oCtx.globalCompositeOperation = 'destination-in';
-        oCtx.drawImage(maskCanvas, 0, 0, out.width, out.height);
-        oCtx.globalCompositeOperation = 'source-over';
+        outCtx.putImageData(outData, 0, 0);
 
         const newImg = new Image();
-        await new Promise((res, rej) => { newImg.onload = res; newImg.onerror = rej; newImg.src = out.toDataURL('image/png'); });
+        await new Promise((res, rej) => {
+          newImg.onload = res;
+          newImg.onerror = rej;
+          newImg.src = outCanvas.toDataURL('image/png');
+        });
 
         img = newImg;
-        scale = Math.max(SIZE / img.width, SIZE / img.height);
-        offsetX = 0; offsetY = 0; rotation = 0;
-        zoomInput.value = scale.toFixed(2); rotateInput.value = 0;
-        updateDisplays(); draw();
-
+        resetTransform();
         bgStatus.textContent = '\u2705 Background removed. You can tweak position if needed.';
         removeBgBtn.textContent = '\ud83d\udd04 Reset BG';
-        removeBgBtn.disabled = false;
       } catch (err) {
-        console.error('Background removal failed:', err);
-        bgStatus.textContent = '\u274c ' + (err.message || 'Background removal failed. Try a clearer photo.');
-        removeBgBtn.disabled = false;
+        console.error('BG removal error:', err);
+        bgStatus.textContent = '\u274c ' + (err.message || 'Failed. Try a clearer front-facing photo.');
       } finally {
         loadingOverlay.classList.remove('active');
         isRemoving = false;
+        removeBgBtn.disabled = false;
       }
     }
 
@@ -546,7 +561,8 @@
       img = null; originalImg = null;
       uploadZone.classList.remove('hidden'); canvasWrapper.classList.remove('active');
       controls.classList.remove('active'); info.style.display = 'block'; result.classList.remove('active');
-      fileInput.value = ''; bgStatus.textContent = ''; segmenter = null;
+      fileInput.value = ''; bgStatus.textContent = '';
+      window.mediapipeSegmenter = null;
       removeBgBtn.textContent = '\u2728 Remove Background';
     });
 
