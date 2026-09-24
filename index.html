@@ -447,12 +447,12 @@
         loadingText.textContent = 'Segmenting portrait\u2026';
         const segResult = seg.segment(srcCanvas);
 
-        // confidenceMasks[0] = background, confidenceMasks[1] = person
+        // confidenceMasks[0] = person confidence (0.0 = no person, 1.0 = person)
         const confs = segResult.confidenceMasks;
-        if (!confs || confs.length < 2) {
+        if (!confs || confs.length === 0) {
           throw new Error('Segmentation failed: no confidence masks returned.');
         }
-        const personMask = confs[1];
+        const personMask = confs[0];
         const mw = personMask.width;
         const mh = personMask.height;
         const maskArr = personMask.getAsFloat32Array();
