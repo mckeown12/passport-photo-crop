@@ -411,7 +411,7 @@
       loadingText.textContent = 'Loading AI model\u2026';
 
       try {
-        // Lazy-load MediaPipe once
+        // Lazy-load MediaPipe once (use confidence masks for reliability)
         if (!window.mediapipeSegmenter) {
           const mod = await import(
             'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm'
@@ -429,14 +429,15 @@
               delegate: 'GPU'
             },
             runningMode: 'IMAGE',
-            outputCategoryMask: true
+            outputConfidenceMasks: true,
+            outputCategoryMask: false
           });
         }
         const seg = window.mediapipeSegmenter;
 
-        // Draw full-res original to a canvas
-        const w = img.width;
-        const h = img.height;
+        // Full-res source canvas
+        const w = originalImg.width;
+        const h = originalImg.height;
         const srcCanvas = document.createElement('canvas');
         srcCanvas.width = w; srcCanvas.height = h;
         const srcCtx = srcCanvas.getContext('2d');
@@ -445,51 +446,62 @@
 
         loadingText.textContent = 'Segmenting portrait\u2026';
         const segResult = seg.segment(srcCanvas);
-        const categoryMask = segResult.categoryMask;
 
-        // Build output by replacing background pixels with white
-        const mw = categoryMask.width;
-        const mh = categoryMask.height;
-        const maskArr = categoryMask.getAsFloat32Array();
+        // confidenceMasks[0] = background, confidenceMasks[1] = person
+        const confs = segResult.confidenceMasks;
+        if (!confs || confs.length < 2) {
+          throw new Error('Segmentation failed: no confidence masks returned.');
+        }
+        const personMask = confs[1];
+        const mw = personMask.width;
+        const mh = personMask.height;
+        const maskArr = personMask.getAsFloat32Array();
+
+        // Sanity check
+        let hasBg = false, hasPerson = false;
+        for (let i = 0; i < maskArr.length; i++) {
+          if (maskArr[i] < 0.3) hasBg = true;
+          else if (maskArr[i] > 0.7) hasPerson = true;
+          if (hasBg && hasPerson) break;
+        }
+        if (!hasBg) {
+          throw new Error('AI could not find a background. Try a real photo with a clearly visible background.');
+        }
+        if (!hasPerson) {
+          throw new Error('AI could not detect a person. Try a clearer front-facing photo.');
+        }
+
+        // Build output RGBA: white bg, person pixels from original
         const outCanvas = document.createElement('canvas');
         outCanvas.width = w; outCanvas.height = h;
         const outCtx = outCanvas.getContext('2d');
         const outData = outCtx.createImageData(w, h);
 
-        // Sanity check: detect uniform mask (model failed to segment)
-        let hasBackground = false, hasPerson = false;
-        for (let i = 0; i < maskArr.length; i++) {
-          if (maskArr[i] <= 0.5) hasBackground = true;
-          else hasPerson = true;
-          if (hasBackground && hasPerson) break;
-        }
-        if (!hasBackground) {
-          throw new Error('The AI could not find a background to remove. Try a clearer front-facing photo of a real person.');
-        }
-        if (!hasPerson) {
-          throw new Error('The AI could not detect a person in the photo. Try a clearer front-facing photo.');
-        }
-
-        // Fast path: mask same size as image
         if (mw === w && mh === h) {
-          outData.data.set(srcData.data);
+          // Fast 1:1 path
           for (let i = 0; i < maskArr.length; i++) {
-            if (maskArr[i] <= 0.5) { // background
-              const p = i * 4;
+            const p = i * 4;
+            const isPerson = maskArr[i] > 0.5;
+            if (isPerson) {
+              outData.data[p]     = srcData.data[p];
+              outData.data[p + 1] = srcData.data[p + 1];
+              outData.data[p + 2] = srcData.data[p + 2];
+            } else {
               outData.data[p] = outData.data[p + 1] = outData.data[p + 2] = 255;
             }
+            outData.data[p + 3] = 255;
           }
         } else {
-          // Resampled path (mask may be downscaled)
+          // Resampled lookup
           const sx = w / mw;
           const sy = h / mh;
           for (let y = 0; y < h; y++) {
             for (let x = 0; x < w; x++) {
               const mx = Math.min(mw - 1, Math.floor(x / sx));
               const my = Math.min(mh - 1, Math.floor(y / sy));
-              const isPerson = maskArr[my * mw + mx] > 0.5;
+              const conf = maskArr[my * mw + mx];
               const p = (y * w + x) * 4;
-              if (isPerson) {
+              if (conf > 0.5) {
                 outData.data[p]     = srcData.data[p];
                 outData.data[p + 1] = srcData.data[p + 1];
                 outData.data[p + 2] = srcData.data[p + 2];
@@ -511,11 +523,11 @@
 
         img = newImg;
         resetTransform();
-        bgStatus.textContent = '\u2705 Background removed. You can tweak position if needed.';
+        bgStatus.textContent = '\u2705 Background removed. Fine-tune if needed.';
         removeBgBtn.textContent = '\ud83d\udd04 Reset BG';
       } catch (err) {
         console.error('BG removal error:', err);
-        bgStatus.textContent = '\u274c ' + (err.message || 'Failed. Try a clearer front-facing photo.');
+        bgStatus.textContent = '\u274c ' + (err.message || 'Background removal failed. Try a clearer front-facing photo.');
       } finally {
         loadingOverlay.classList.remove('active');
         isRemoving = false;
