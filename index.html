@@ -177,6 +177,11 @@
         <input type="range" id="rotate" min="-15" max="15" step="0.5" value="0">
         <span class="val-display" id="rotateVal">0°</span>
       </div>
+      <div class="control-row">
+        <label>Feather</label>
+        <input type="range" id="feather" min="0" max="16" step="1" value="4">
+        <span class="val-display" id="featherVal">4px</span>
+      </div>
       <div class="bg-rm-status" id="bgStatus"></div>
       <div class="buttons">
         <button class="btn btn-secondary" id="resetBtn">Reset</button>
@@ -198,7 +203,8 @@
       </ul>
       <div class="note">
         Tip: Use <span class="kbd">↑↓←→</span> to nudge, <span class="kbd">+</span>/<span class="kbd">−</span> to zoom.
-        Drag to pan. "Remove Background" uses MediaPipe AI — runs locally in your browser.
+        Drag to pan. "Remove Background" runs on your current crop — entirely in your browser.
+        <strong>Feather</strong> softens the edge of the background cut (0 = hard edge).
       </div>
     </div>
 
@@ -208,6 +214,7 @@
       <p class="meta">600 × 600 pixels at 300 DPI (2 × 2 inches)</p>
       <div class="buttons">
         <a class="btn btn-success" id="downloadLink" download="passport-photo.png">Download PNG</a>
+        <button class="btn btn-primary" id="downloadPdfBtn">Download PDF (Print-Ready)</button>
         <button class="btn btn-secondary" id="backBtn">Back to Editor</button>
       </div>
     </div>
@@ -225,6 +232,8 @@
     const zoomVal    = document.getElementById('zoomVal');
     const rotateInput= document.getElementById('rotate');
     const rotateVal  = document.getElementById('rotateVal');
+    const featherInput = document.getElementById('feather');
+    const featherVal   = document.getElementById('featherVal');
     const removeBgBtn= document.getElementById('removeBgBtn');
     const resetBtn   = document.getElementById('resetBtn');
     const exportBtn  = document.getElementById('exportBtn');
@@ -404,6 +413,59 @@
       reader.readAsDataURL(file);
     }
 
+    // ─── Mask helpers ───
+    // Bilinear-resample a float32 mask from (mw×mh) to (w×h)
+    function resampleMask(src, mw, mh, w, h) {
+      if (mw === w && mh === h) return new Float32Array(src);
+      const out = new Float32Array(w * h);
+      const sx = mw / w, sy = mh / h;
+      for (let y = 0; y < h; y++) {
+        const fy = (y + 0.5) * sy - 0.5;
+        const y0 = Math.max(0, Math.floor(fy)), y1 = Math.min(mh - 1, y0 + 1);
+        const wy = Math.min(1, Math.max(0, fy - y0));
+        for (let x = 0; x < w; x++) {
+          const fx = (x + 0.5) * sx - 0.5;
+          const x0 = Math.max(0, Math.floor(fx)), x1 = Math.min(mw - 1, x0 + 1);
+          const wx = Math.min(1, Math.max(0, fx - x0));
+          const top = src[y0 * mw + x0] + (src[y0 * mw + x1] - src[y0 * mw + x0]) * wx;
+          const bot = src[y1 * mw + x0] + (src[y1 * mw + x1] - src[y1 * mw + x0]) * wx;
+          out[y * w + x] = top + (bot - top) * wy;
+        }
+      }
+      return out;
+    }
+
+    // Separable box blur ×3 ≈ gaussian, clamped edges. radius in pixels.
+    function blurMask(input, w, h, radius) {
+      const r = Math.floor(radius);
+      if (r < 1) return input;
+      let src = new Float32Array(input);
+      const dst = new Float32Array(input.length);
+      const norm = 1 / (2 * r + 1);
+      for (let pass = 0; pass < 3; pass++) {
+        // horizontal
+        for (let y = 0; y < h; y++) {
+          let sum = 0;
+          const row = y * w;
+          for (let x = -r; x <= r; x++) sum += src[row + Math.min(w - 1, Math.max(0, x))];
+          for (let x = 0; x < w; x++) {
+            dst[row + x] = sum * norm;
+            sum += src[row + Math.min(w - 1, x + r + 1)] - src[row + Math.max(0, x - r)];
+          }
+        }
+        // vertical
+        for (let x = 0; x < w; x++) {
+          let sum = 0;
+          for (let y = -r; y <= r; y++) sum += dst[Math.min(h - 1, Math.max(0, y)) * w + x];
+          for (let y = 0; y < h; y++) {
+            src[y * w + x] = sum * norm;
+            sum += dst[Math.min(h - 1, y + r + 1) * w + x] - dst[Math.max(0, y - r) * w + x];
+          }
+        }
+      }
+      return src;
+    }
+
     // ─── Background Removal (MediaPipe) ───
     async function removeBackground() {
       if (!img || isRemoving) return;
@@ -438,17 +500,26 @@
         }
         const seg = window.mediapipeSegmenterV2;
 
-        // Full-res source canvas
-        const w = originalImg.width;
-        const h = originalImg.height;
-        const srcCanvas = document.createElement('canvas');
-        srcCanvas.width = w; srcCanvas.height = h;
-        const srcCtx = srcCanvas.getContext('2d');
-        srcCtx.drawImage(originalImg, 0, 0);
-        const srcData = srcCtx.getImageData(0, 0, w, h);
+        // 1) Apply the current crop FIRST: render the 2×2 view to SIZE×SIZE,
+        //    then segment that — faster, and the model sees a headshot-framed image.
+        loadingText.textContent = 'Cropping to 2\u00d72\u2026';
+        const w = SIZE, h = SIZE;
+        const cropCanvas = document.createElement('canvas');
+        cropCanvas.width = w; cropCanvas.height = h;
+        const cropCtx = cropCanvas.getContext('2d');
+        cropCtx.fillStyle = '#ffffff';
+        cropCtx.fillRect(0, 0, w, h);
+        cropCtx.save();
+        cropCtx.translate(SIZE / 2 + offsetX, SIZE / 2 + offsetY);
+        cropCtx.rotate(rotation * Math.PI / 180);
+        cropCtx.scale(scale, scale);
+        cropCtx.drawImage(img, -img.width / 2, -img.height / 2);
+        cropCtx.restore();
+        const srcData = cropCtx.getImageData(0, 0, w, h);
 
+        // 2) Segment the cropped image
         loadingText.textContent = 'Segmenting portrait\u2026';
-        const segResult = seg.segment(srcCanvas);
+        const segResult = seg.segment(cropCanvas);
 
         // confidenceMasks[0] = person confidence (0.0 = no person, 1.0 = person)
         const confs = segResult.confidenceMasks;
@@ -474,46 +545,28 @@
           throw new Error('AI could not detect a person. Try a clearer front-facing photo.');
         }
 
-        // Build output RGBA: white bg, person pixels from original
+        // 3) Resample mask to full size, then feather (soften) it
+        let mask = resampleMask(maskArr, mw, mh, w, h);
+        const feather = parseInt(featherInput.value, 10);
+        if (feather > 0) {
+          loadingText.textContent = 'Softening edges\u2026';
+          mask = blurMask(mask, w, h, feather);
+        }
+
+        // 4) Composite: out = person * mask + white * (1 - mask) — soft edges
         const outCanvas = document.createElement('canvas');
         outCanvas.width = w; outCanvas.height = h;
         const outCtx = outCanvas.getContext('2d');
         const outData = outCtx.createImageData(w, h);
-
-        if (mw === w && mh === h) {
-          // Fast 1:1 path
-          for (let i = 0; i < maskArr.length; i++) {
-            const p = i * 4;
-            const isPerson = maskArr[i] > 0.5;
-            if (isPerson) {
-              outData.data[p]     = srcData.data[p];
-              outData.data[p + 1] = srcData.data[p + 1];
-              outData.data[p + 2] = srcData.data[p + 2];
-            } else {
-              outData.data[p] = outData.data[p + 1] = outData.data[p + 2] = 255;
-            }
-            outData.data[p + 3] = 255;
-          }
-        } else {
-          // Resampled lookup
-          const sx = w / mw;
-          const sy = h / mh;
-          for (let y = 0; y < h; y++) {
-            for (let x = 0; x < w; x++) {
-              const mx = Math.min(mw - 1, Math.floor(x / sx));
-              const my = Math.min(mh - 1, Math.floor(y / sy));
-              const conf = maskArr[my * mw + mx];
-              const p = (y * w + x) * 4;
-              if (conf > 0.5) {
-                outData.data[p]     = srcData.data[p];
-                outData.data[p + 1] = srcData.data[p + 1];
-                outData.data[p + 2] = srcData.data[p + 2];
-              } else {
-                outData.data[p] = outData.data[p + 1] = outData.data[p + 2] = 255;
-              }
-              outData.data[p + 3] = 255;
-            }
-          }
+        const od = outData.data, sd = srcData.data;
+        for (let i = 0; i < mask.length; i++) {
+          let m = mask[i];
+          if (m < 0) m = 0; else if (m > 1) m = 1;
+          const p = i * 4;
+          od[p]     = 255 + (sd[p]     - 255) * m;
+          od[p + 1] = 255 + (sd[p + 1] - 255) * m;
+          od[p + 2] = 255 + (sd[p + 2] - 255) * m;
+          od[p + 3] = 255;
         }
         outCtx.putImageData(outData, 0, 0);
 
@@ -525,7 +578,7 @@
         });
 
         img = newImg;
-        resetTransform();
+        resetTransform(); // image is exactly the crop now → display unchanged
         bgStatus.textContent = '\u2705 Background removed. Fine-tune if needed.';
         removeBgBtn.textContent = '\ud83d\udd04 Reset BG';
       } catch (err) {
@@ -585,6 +638,7 @@
 
     zoomInput.addEventListener('input', (e) => { scale = parseFloat(e.target.value); updateDisplays(); draw(); });
     rotateInput.addEventListener('input', (e) => { rotation = parseFloat(e.target.value); updateDisplays(); draw(); });
+    featherInput.addEventListener('input', (e) => { featherVal.textContent = e.target.value + 'px'; });
     resetBtn.addEventListener('click', resetTransform);
     newPhotoBtn.addEventListener('click', () => {
       img = null; originalImg = null;
