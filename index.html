@@ -116,6 +116,23 @@
     .btn-secondary:hover { background: #cbd5e1; }
     .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
+    /* Touch-up (manual brush + bg whiten) */
+    .touchup { display: none; flex-direction: column; gap: 10px; width: 100%; }
+    .tool-btn {
+      padding: 8px 12px; border-radius: 8px; border: 2px solid var(--border);
+      background: #fff; font-size: 0.85rem; font-weight: 600; cursor: pointer;
+      color: var(--text); transition: border-color 0.15s, background 0.15s;
+    }
+    .tool-btn:hover { border-color: var(--primary); }
+    .tool-btn.active { border-color: var(--primary); background: #eff6ff; color: var(--primary); }
+    .touchup-hint { font-size: 0.75rem; margin-left: auto; }
+    #brushCursor {
+      position: absolute; display: none; pointer-events: none; z-index: 5;
+      border: 2px solid rgba(37, 99, 235, 0.9); border-radius: 50%;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.9), 0 0 6px rgba(37, 99, 235, 0.4);
+      transform: translate(-50%, -50%);
+    }
+
     /* Info */
     .info { width: 100%; max-width: 480px; background: var(--panel); border: 1px solid var(--border);
       border-radius: 12px; padding: 16px 18px; font-size: 0.85rem; box-shadow: var(--shadow); }
@@ -163,6 +180,7 @@
       <div class="olabel" id="lblEyeBot">eye min 1⅛″</div>
       <div class="olabel right" id="lblHeadMax">head max 1⅜″</div>
       <div class="olabel right" id="lblHeadMin">head min 1″</div>
+      <div id="brushCursor"></div>
     </div>
 
     <!-- Controls -->
@@ -181,6 +199,27 @@
         <label>Feather</label>
         <input type="range" id="feather" min="0" max="16" step="1" value="4">
         <span class="val-display" id="featherVal">4px</span>
+      </div>
+      <div class="touchup" id="touchup">
+        <div class="control-row">
+          <button class="tool-btn" id="eraseTool">🧽 Erase BG</button>
+          <button class="tool-btn" id="restoreTool">👤 Restore</button>
+          <span class="muted touchup-hint">paint to fix mistakes</span>
+        </div>
+        <div class="control-row">
+          <label>Brush</label>
+          <input type="range" id="brushSize" min="4" max="80" step="1" value="24">
+          <span class="val-display" id="brushVal">24px</span>
+        </div>
+        <div class="control-row">
+          <label>BG Whiten</label>
+          <input type="range" id="whiten" min="0" max="100" step="1" value="100">
+          <span class="val-display" id="whitenVal">100%</span>
+        </div>
+        <div class="buttons">
+          <button class="btn btn-secondary" id="undoBtn">↩️ Undo stroke</button>
+          <button class="btn btn-secondary" id="clearEditsBtn">Clear edits</button>
+        </div>
       </div>
       <div class="bg-rm-status" id="bgStatus"></div>
       <div class="buttons">
@@ -204,7 +243,10 @@
       <div class="note">
         Tip: Use <span class="kbd">↑↓←→</span> to nudge, <span class="kbd">+</span>/<span class="kbd">−</span> to zoom.
         Drag to pan. "Remove Background" runs on your current crop — entirely in your browser.
-        <strong>Feather</strong> softens the edge of the background cut (0 = hard edge).
+        <strong>Feather</strong> softens the AI cut edge (0 = hard edge).
+        After removal, paint with <strong>🧽 Erase</strong>/<strong>👤 Restore</strong> to fix mistakes,
+        and use <strong>BG Whiten</strong> to decide how white the backdrop gets — 100% = pure white,
+        lower values keep more of the original background's tone.
       </div>
     </div>
 
@@ -247,6 +289,16 @@
     const loadingOverlay = document.getElementById('loadingOverlay');
     const loadingText    = document.getElementById('loadingText');
     const bgStatus       = document.getElementById('bgStatus');
+    const touchup        = document.getElementById('touchup');
+    const eraseToolBtn   = document.getElementById('eraseTool');
+    const restoreToolBtn = document.getElementById('restoreTool');
+    const brushSizeInput = document.getElementById('brushSize');
+    const brushVal       = document.getElementById('brushVal');
+    const undoBtn        = document.getElementById('undoBtn');
+    const clearEditsBtn  = document.getElementById('clearEditsBtn');
+    const whitenInput    = document.getElementById('whiten');
+    const whitenVal      = document.getElementById('whitenVal');
+    const brushCursor    = document.getElementById('brushCursor');
 
     let lastExportDataUrl = '';
 
@@ -270,6 +322,16 @@
     let scale = 1, offsetX = 0, offsetY = 0, rotation = 0;
     let isDragging = false, lastX = 0, lastY = 0;
     let isRemoving = false;
+    // Background-removal state (null until "Remove Background" succeeds):
+    //   original — the 600×600 crop before any processing
+    //   raw      — person-confidence mask, resampled, unblurred
+    //   base     — raw mask with the current Feather blur applied
+    //   mask     — working mask; brush tools edit this
+    //   whiten   — 0..1, how much leftover background is pushed toward white
+    let bg = null;
+    let activeTool = null; // 'erase' | 'restore'
+    let painting = false, lastPt = null;
+    let compositeQueued = false;
 
     // ─── Drawing ───
     function drawGuides() {
@@ -466,6 +528,95 @@
       return src;
     }
 
+    // ─── Live composite + manual touch-up ───
+    // out = orig + (255 − orig) · whiten · (1 − mask)
+    //   mask = 1 → original person pixels (unchanged)
+    //   mask = 0 → original background, pushed toward white by `whiten`
+    function renderComposite() {
+      if (!bg) return;
+      const sd = bg.original.data, md = bg.mask, od = bg.composite.data;
+      const wgt = bg.whiten;
+      for (let i = 0; i < md.length; i++) {
+        let m = md[i];
+        if (m < 0) m = 0; else if (m > 1) m = 1;
+        const p = i * 4, w1 = wgt * (1 - m);
+        od[p]     = sd[p]     + (255 - sd[p])     * w1;
+        od[p + 1] = sd[p + 1] + (255 - sd[p + 1]) * w1;
+        od[p + 2] = sd[p + 2] + (255 - sd[p + 2]) * w1;
+        od[p + 3] = 255;
+      }
+      bg.ctx.putImageData(bg.composite, 0, 0);
+    }
+    function scheduleComposite() {
+      if (compositeQueued) return;
+      compositeQueued = true;
+      requestAnimationFrame(() => { compositeQueued = false; renderComposite(); draw(); });
+    }
+
+    // Soft circular stamp toward target (0 = erase person, 1 = restore person)
+    function stampBrush(ix, iy, radius, target) {
+      const md = bg.mask;
+      const r = Math.max(1, radius);
+      const x0 = Math.max(0, Math.floor(ix - r)), x1 = Math.min(SIZE - 1, Math.ceil(ix + r));
+      const y0 = Math.max(0, Math.floor(iy - r)), y1 = Math.min(SIZE - 1, Math.ceil(iy + r));
+      for (let y = y0; y <= y1; y++) {
+        for (let x = x0; x <= x1; x++) {
+          const dx = x - ix, dy = y - iy;
+          const d2 = dx * dx + dy * dy;
+          if (d2 > r * r) continue;
+          const d = Math.sqrt(d2) / r;
+          const fall = 0.5 * (1 + Math.cos(Math.PI * d)); // smooth 1 → 0 at edge
+          const idx = y * SIZE + x;
+          md[idx] += (target - md[idx]) * fall;
+        }
+      }
+    }
+    function strokeTo(x0, y0, x1, y1, radius, target) {
+      const dist = Math.hypot(x1 - x0, y1 - y0);
+      const steps = Math.max(1, Math.ceil(dist / Math.max(1, radius * 0.4)));
+      for (let s = 0; s <= steps; s++) {
+        stampBrush(x0 + (x1 - x0) * s / steps, y0 + (y1 - y0) * s / steps, radius, target);
+      }
+    }
+
+    // Canvas (screen) point → image coordinates (inverse of display transform)
+    function canvasPoint(e) {
+      const rect = canvas.getBoundingClientRect();
+      const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+      const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+      const dx = x - SIZE / 2 - offsetX, dy = y - SIZE / 2 - offsetY;
+      const a = -rotation * Math.PI / 180;
+      const ux = dx * Math.cos(a) - dy * Math.sin(a);
+      const uy = dx * Math.sin(a) + dy * Math.cos(a);
+      return { x: ux / scale + SIZE / 2, y: uy / scale + SIZE / 2 };
+    }
+
+    function setTool(t) {
+      activeTool = (activeTool === t) ? null : t;
+      eraseToolBtn.classList.toggle('active', activeTool === 'erase');
+      restoreToolBtn.classList.toggle('active', activeTool === 'restore');
+      canvas.style.cursor = activeTool ? 'none' : '';
+      brushCursor.style.display = activeTool ? 'block' : 'none';
+    }
+    function moveBrushCursor(e) {
+      if (!activeTool) return;
+      const rect = canvas.getBoundingClientRect();
+      const d = parseInt(brushSizeInput.value, 10) * (rect.width / SIZE);
+      brushCursor.style.width = d + 'px';
+      brushCursor.style.height = d + 'px';
+      brushCursor.style.left = (e.clientX - rect.left) + 'px';
+      brushCursor.style.top = (e.clientY - rect.top) + 'px';
+    }
+    function showTouchup() {
+      touchup.style.display = 'flex';
+      whitenInput.value = Math.round(bg.whiten * 100);
+      whitenVal.textContent = Math.round(bg.whiten * 100) + '%';
+    }
+    function hideTouchup() {
+      touchup.style.display = 'none';
+      setTool(null);
+    }
+
     // ─── Background Removal (MediaPipe) ───
     async function removeBackground() {
       if (!img || isRemoving) return;
@@ -546,40 +697,32 @@
         }
 
         // 3) Resample mask to full size, then feather (soften) it
-        let mask = resampleMask(maskArr, mw, mh, w, h);
+        const rawMask = resampleMask(maskArr, mw, mh, w, h);
         const feather = parseInt(featherInput.value, 10);
-        if (feather > 0) {
-          loadingText.textContent = 'Softening edges\u2026';
-          mask = blurMask(mask, w, h, feather);
-        }
+        loadingText.textContent = 'Softening edges\u2026';
+        const baseMask = feather > 0 ? blurMask(rawMask, w, h, feather) : rawMask.slice();
 
-        // 4) Composite: out = person * mask + white * (1 - mask) — soft edges
-        const outCanvas = document.createElement('canvas');
-        outCanvas.width = w; outCanvas.height = h;
-        const outCtx = outCanvas.getContext('2d');
-        const outData = outCtx.createImageData(w, h);
-        const od = outData.data, sd = srcData.data;
-        for (let i = 0; i < mask.length; i++) {
-          let m = mask[i];
-          if (m < 0) m = 0; else if (m > 1) m = 1;
-          const p = i * 4;
-          od[p]     = 255 + (sd[p]     - 255) * m;
-          od[p + 1] = 255 + (sd[p + 1] - 255) * m;
-          od[p + 2] = 255 + (sd[p + 2] - 255) * m;
-          od[p + 3] = 255;
-        }
-        outCtx.putImageData(outData, 0, 0);
+        // 4) Keep the original crop + person mask; the visible photo is a live
+        //    composite: person where mask = 1, original background pushed toward
+        //    white (BG Whiten slider) where mask = 0. Brush tools edit the mask.
+        bg = {
+          original: srcData,
+          raw: rawMask,
+          base: baseMask,
+          mask: baseMask.slice(),
+          whiten: parseInt(whitenInput.value, 10) / 100,
+          undo: []
+        };
+        bg.canvas = document.createElement('canvas');
+        bg.canvas.width = w; bg.canvas.height = h;
+        bg.ctx = bg.canvas.getContext('2d');
+        bg.composite = bg.ctx.createImageData(w, h);
+        renderComposite();
 
-        const newImg = new Image();
-        await new Promise((res, rej) => {
-          newImg.onload = res;
-          newImg.onerror = rej;
-          newImg.src = outCanvas.toDataURL('image/png');
-        });
-
-        img = newImg;
+        img = bg.canvas;
         resetTransform(); // image is exactly the crop now → display unchanged
-        bgStatus.textContent = '\u2705 Background removed. Fine-tune if needed.';
+        showTouchup();
+        bgStatus.textContent = '\u2705 Background removed. Paint over mistakes with the brushes.';
         removeBgBtn.textContent = '\ud83d\udd04 Reset BG';
       } catch (err) {
         console.error('BG removal error:', err);
@@ -594,6 +737,9 @@
     removeBgBtn.addEventListener('click', () => {
       if (removeBgBtn.textContent.includes('Reset')) {
         img = originalImg;
+        bg = null;
+        hideTouchup();
+        whitenInput.value = 100; whitenVal.textContent = '100%';
         bgStatus.textContent = '';
         removeBgBtn.textContent = '\u2728 Remove Background';
         removeBgBtn.disabled = false;
@@ -611,8 +757,8 @@
     ['dragleave','drop'].forEach(evt => uploadZone.addEventListener(evt, (e) => { e.preventDefault(); uploadZone.classList.remove('dragover'); }));
     uploadZone.addEventListener('drop', (e) => { const file = e.dataTransfer.files[0]; if (file && file.type.startsWith('image/')) loadImage(file); });
 
-    // Pan (mouse)
-    canvas.addEventListener('mousedown', (e) => { isDragging = true; lastX = e.clientX; lastY = e.clientY; });
+    // Pan (mouse) — disabled while a brush tool is active
+    canvas.addEventListener('mousedown', (e) => { if (activeTool) return; isDragging = true; lastX = e.clientX; lastY = e.clientY; });
     window.addEventListener('mousemove', (e) => {
       if (!isDragging) return;
       offsetX += e.clientX - lastX; offsetY += e.clientY - lastY; lastX = e.clientX; lastY = e.clientY; draw();
@@ -620,7 +766,7 @@
     window.addEventListener('mouseup', () => isDragging = false);
 
     // Pan (touch)
-    canvas.addEventListener('touchstart', (e) => { if (e.touches.length === 1) { isDragging = true; lastX = e.touches[0].clientX; lastY = e.touches[0].clientY; } }, { passive: false });
+    canvas.addEventListener('touchstart', (e) => { if (activeTool) return; if (e.touches.length === 1) { isDragging = true; lastX = e.touches[0].clientX; lastY = e.touches[0].clientY; } }, { passive: false });
     canvas.addEventListener('touchmove', (e) => {
       if (!isDragging || e.touches.length !== 1) return; e.preventDefault();
       offsetX += e.touches[0].clientX - lastX; offsetY += e.touches[0].clientY - lastY;
@@ -638,10 +784,67 @@
 
     zoomInput.addEventListener('input', (e) => { scale = parseFloat(e.target.value); updateDisplays(); draw(); });
     rotateInput.addEventListener('input', (e) => { rotation = parseFloat(e.target.value); updateDisplays(); draw(); });
-    featherInput.addEventListener('input', (e) => { featherVal.textContent = e.target.value + 'px'; });
+    featherInput.addEventListener('input', (e) => {
+      featherVal.textContent = e.target.value + 'px';
+      if (!bg) return; // only matters after a successful removal
+      const f = parseInt(e.target.value, 10);
+      bg.base = f > 0 ? blurMask(bg.raw, SIZE, SIZE, f) : bg.raw.slice();
+      bg.mask = bg.base.slice(); // re-deriving the cut resets manual edits
+      bg.undo.length = 0;
+      renderComposite(); draw();
+      bgStatus.textContent = '\ud83e\uddf3 Feather ' + f + 'px — manual edits were reset.';
+    });
+    brushSizeInput.addEventListener('input', (e) => { brushVal.textContent = e.target.value + 'px'; });
+    whitenInput.addEventListener('input', (e) => {
+      whitenVal.textContent = e.target.value + '%';
+      if (!bg) return;
+      bg.whiten = parseInt(e.target.value, 10) / 100;
+      renderComposite(); draw();
+    });
+    eraseToolBtn.addEventListener('click', () => setTool('erase'));
+    restoreToolBtn.addEventListener('click', () => setTool('restore'));
+    undoBtn.addEventListener('click', () => {
+      if (!bg || !bg.undo.length) return;
+      bg.mask = bg.undo.pop();
+      renderComposite(); draw();
+    });
+    clearEditsBtn.addEventListener('click', () => {
+      if (!bg) return;
+      bg.mask = bg.base.slice();
+      bg.undo.length = 0;
+      renderComposite(); draw();
+    });
+
+    // ─── Brush painting (pointer events: mouse + touch) ───
+    canvas.addEventListener('pointerdown', (e) => {
+      if (!activeTool || !bg) return;
+      e.preventDefault();
+      painting = true;
+      bg.undo.push(bg.mask.slice());
+      if (bg.undo.length > 15) bg.undo.shift();
+      lastPt = canvasPoint(e);
+      const r = parseInt(brushSizeInput.value, 10) / scale;
+      stampBrush(lastPt.x, lastPt.y, r, activeTool === 'erase' ? 0 : 1);
+      scheduleComposite();
+    });
+    window.addEventListener('pointermove', (e) => {
+      if (activeTool) moveBrushCursor(e);
+      if (!painting || !activeTool || !bg) return;
+      const p = canvasPoint(e);
+      const r = parseInt(brushSizeInput.value, 10) / scale;
+      strokeTo(lastPt.x, lastPt.y, p.x, p.y, r, activeTool === 'erase' ? 0 : 1);
+      lastPt = p;
+      scheduleComposite();
+    });
+    window.addEventListener('pointerup', () => { painting = false; });
+    canvas.addEventListener('pointerenter', () => { if (activeTool) brushCursor.style.display = 'block'; });
+    canvas.addEventListener('pointerleave', () => { brushCursor.style.display = 'none'; });
+
     resetBtn.addEventListener('click', resetTransform);
     newPhotoBtn.addEventListener('click', () => {
       img = null; originalImg = null;
+      bg = null; hideTouchup();
+      whitenInput.value = 100; whitenVal.textContent = '100%';
       uploadZone.classList.remove('hidden'); canvasWrapper.classList.remove('active');
       controls.classList.remove('active'); info.style.display = 'block'; result.classList.remove('active');
       fileInput.value = ''; bgStatus.textContent = '';
